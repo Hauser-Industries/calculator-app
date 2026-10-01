@@ -79,6 +79,20 @@
       "highPrice": 200
     }
   },
+  "defaultLaborRates": {
+    "weldHourlyRate": 25,
+    "assemblyHourlyRate": 22,
+    "grindHourlyRate": 22,
+    "paintHourlyRate": 24
+  },
+  "defaultPaintSettings": {
+    "materialRatePerKg": 15,
+    "lowDimensionThreshold": 48,
+    "mediumDimensionThreshold": 72,
+    "lowMinutes": 20,
+    "mediumMinutes": 24,
+    "highMinutes": 48
+  },
   "defaultResultColorThresholds": {
     "marginWarnMax": 20,
     "marginGoodMin": 35,

@@ -1,8 +1,8 @@
 import type { CostBreakdownPreview, CostThreshold, PlanterInput } from '@/types'
 import {
-  CATEGORY_LIST,
-  DEFAULT_THRESHOLDS,
   type Category,
+  type TerracePlanterLaborRates,
+  type TerracePlanterPaintSettings,
 } from '@/lib/terrace_planter/planterDefaults'
 import {
   DEFAULT_SHEET_INVENTORY,
@@ -14,6 +14,16 @@ import {
   type SheetInventoryRow,
   type SolverResult,
 } from '@/lib/terrace_planter/planterSolver'
+import {
+  buildTerracePlanterCostBreakdowns,
+  getTerracePlanterAssemblyMinutes,
+  getTerracePlanterGrindMinutes,
+  getTerracePlanterPaintLaborMinutes,
+  getTerracePlanterPaintWeightKg,
+  getTerracePlanterWeldMinutes,
+  normalizeTerracePlanterPaintSettings,
+  TERRACE_PLANTER_COST_CATEGORY_ORDER,
+} from '@/lib/terrace_planter/planterCosts'
 
 export type TerracePlanterCustomDetailRow = {
   category?: string
@@ -36,6 +46,8 @@ export type TerracePlanterSheetSummary = {
 
 export type CalculateTerracePlanterOptions = {
   thresholds?: Partial<Record<Category, CostThreshold>>
+  laborRates?: Partial<TerracePlanterLaborRates>
+  paintSettings?: Partial<TerracePlanterPaintSettings>
   sheetInventory?: SheetInventoryRow[]
   customDetailRows?: TerracePlanterCustomDetailRow[]
   userSalePriceInput?: number | string | null
@@ -51,6 +63,7 @@ export type CalculateTerracePlanterRequest = {
 export type TerracePlanterCalculationRawResult = {
   fabricationDims: FabricationDimensions
   volume: number
+  paintSettings: TerracePlanterPaintSettings
   breakdowns: CostBreakdownPreview[]
   solverResult: SolverResult
   sheetSummaries: TerracePlanterSheetSummary[]
@@ -87,8 +100,6 @@ const CUT_PLAN_MAX_DISPLAY_DIMENSION = 500
 const CUT_PLAN_MIN_DISPLAY_SCALE = 0.95
 const CUT_PLAN_MAX_DISPLAY_SCALE = 4.25
 const INCH_TO_MM = 25.4
-const categoryList: Category[] = [...CATEGORY_LIST]
-
 const getBreakdownPrice = (row: CostBreakdownPreview) => row.overridePrice ?? row.basePrice
 
 type CutPlanPaletteEntry = {
@@ -138,23 +149,6 @@ const CUT_PLAN_LEGEND_GROUPS = [
   { label: 'Liner', group: 'liner' },
 ]
 
-const cloneThresholds = (source?: Partial<Record<Category, CostThreshold>>) =>
-  categoryList.reduce<Record<Category, CostThreshold>>((acc, category) => {
-    const template = source?.[category] ?? DEFAULT_THRESHOLDS[category]
-    acc[category] = { ...template, category }
-    return acc
-  }, {} as Record<Category, CostThreshold>)
-
-const determineTier = (volume: number, threshold: CostThreshold) => {
-  if (volume <= threshold.lowThreshold) {
-    return { tier: 'Low' as const, price: threshold.lowPrice }
-  }
-  if (volume <= threshold.mediumThreshold) {
-    return { tier: 'Medium' as const, price: threshold.mediumPrice }
-  }
-  return { tier: 'High' as const, price: threshold.highPrice }
-}
-
 const validatePlanterInput = (input: PlanterInput) => {
   if (!Number.isFinite(input.length)) return 'Length must be a valid number.'
   if (input.length <= 0) return 'Length must be greater than zero.'
@@ -177,43 +171,6 @@ const validatePlanterInput = (input: PlanterInput) => {
   if (input.linerEnabled && input.linerThickness <= 0) return 'Liner thickness must be greater than zero.'
   return null
 }
-
-const validateThresholds = (thresholds: Record<Category, CostThreshold>) => {
-  const hasInvalidThreshold = categoryList.some((category) => {
-    const entry = thresholds[category]
-    return (
-      !Number.isFinite(entry.lowThreshold) ||
-      !Number.isFinite(entry.mediumThreshold) ||
-      !Number.isFinite(entry.lowPrice) ||
-      !Number.isFinite(entry.mediumPrice) ||
-      !Number.isFinite(entry.highPrice) ||
-      entry.lowThreshold >= entry.mediumThreshold
-    )
-  })
-
-  return hasInvalidThreshold ? 'Resolve invalid threshold settings before calculating.' : null
-}
-
-const buildBreakdownResults = (
-  volume: number,
-  planterInput: PlanterInput,
-  thresholds: Record<Category, CostThreshold>,
-): CostBreakdownPreview[] =>
-  categoryList.map((category) => {
-    if (category === 'Weight Plate' && !planterInput.weightPlateEnabled) {
-      return { category, tierUsed: 'Not Selected', basePrice: 0, overridePrice: null }
-    }
-    if (category === 'Liner' && !planterInput.linerEnabled) {
-      return { category, tierUsed: 'Not Selected', basePrice: 0, overridePrice: null }
-    }
-    if (category === 'Shelf' && !planterInput.shelfEnabled) {
-      return { category, tierUsed: 'Not Selected', basePrice: 0, overridePrice: null }
-    }
-
-    const threshold = thresholds[category]
-    const { tier, price } = determineTier(volume, threshold)
-    return { category, tierUsed: tier, basePrice: price, overridePrice: null }
-  })
 
 const formatDimension = (valueInInches: number, fractionDigits = 2) =>
   `${valueInInches.toFixed(fractionDigits)} in`
@@ -333,11 +290,17 @@ const formatCurrency = (value: number) => (Number.isFinite(value) ? `$${value.to
 
 const formatPercent = (value: number) => `${value.toFixed(1)}%`
 
+const formatMinutes = (value: number | null) => {
+  if (value === null || !Number.isFinite(value)) return ''
+  return Number.isInteger(value) ? value.toFixed(0) : value.toFixed(2).replace(/\.00$/, '')
+}
+
 const formatCssPx = (value: number) => `${Number.isFinite(value) ? value.toFixed(2) : '0'}px`
 
 type TerracePlanterCostDetailVisualRow = {
   category: string
   tierUsed: string
+  minutes: number | null
   basePrice: number
   overridePrice: number | null
   notes: string
@@ -410,6 +373,7 @@ const buildCostDetailRows = (
     {
       category: 'Material',
       tierUsed: cheapestSheet ? cheapestSheet.name : 'Awaiting calculation',
+      minutes: null,
       basePrice: raw.totalMaterialCost,
       overridePrice: null,
       notes: `Material tier driven by ${cheapestSheet?.name ?? 'inventory'}${sheetNames ? ` (${sheetNames})` : ''}.`,
@@ -417,31 +381,47 @@ const buildCostDetailRows = (
     },
   ]
 
-  for (const category of categoryList) {
+  for (const category of TERRACE_PLANTER_COST_CATEGORY_ORDER) {
     const breakdown = breakdownLookup[category]
     const isDisabled =
       (category === 'Weight Plate' && !planterInput.weightPlateEnabled) ||
       (category === 'Liner' && !planterInput.linerEnabled) ||
       (category === 'Shelf' && !planterInput.shelfEnabled)
     const disabledName = category === 'Weight Plate' ? 'Weight plate' : category
-    const tierUsed = isDisabled ? 'Disabled' : breakdown?.tierUsed ?? '-'
+    const tierUsed =
+      category === 'Paint Material' ? `${getTerracePlanterPaintWeightKg(planterInput).toFixed(3)} kg` : ''
+    const minutes =
+      category === 'Weld'
+        ? getTerracePlanterWeldMinutes(planterInput)
+        : category === 'Assembly'
+          ? getTerracePlanterAssemblyMinutes(planterInput)
+          : category === 'Grind'
+            ? getTerracePlanterGrindMinutes(planterInput)
+            : category === 'Paint Labor'
+              ? getTerracePlanterPaintLaborMinutes(planterInput, raw.paintSettings)
+              : null
     const basePrice = isDisabled ? 0 : breakdown?.basePrice ?? 0
     const overridePrice = isDisabled ? null : breakdown?.overridePrice ?? null
     const notes = isDisabled
       ? `${disabledName} feature disabled.`
-      : breakdown?.tierUsed === 'Not Selected'
-        ? `${category} is not selected yet.`
-        : category === 'Liner'
-          ? 'Liner labor tier applied.'
-          : category === 'Shelf'
-            ? 'Shelf tier applied.'
-            : category === 'Weight Plate'
-              ? 'Weight plate tier applied.'
-              : `${breakdown?.tierUsed ?? '-'} tier applied.`
+      : category === 'Weld'
+          ? 'Weld time includes the planter, floor, shelf, and liner selections.'
+          : category === 'Assembly'
+            ? 'Assembly starts at 20 minutes; a weight plate adds 10 minutes.'
+            : category === 'Grind'
+              ? 'Grind time is 50% of Weld minutes.'
+              : category === 'Paint Material'
+                ? 'Paint material weight multiplied by the configured cost per kg.'
+                : category === 'Paint Labor'
+                  ? 'Paint labor minutes use the configured largest-dimension thresholds.'
+              : category === 'Overhead'
+                ? '150% of Weld, Grind, Paint Labor, Assembly, Saw, and Laser Bend prices.'
+                : 'Fixed base price applied.'
 
     rows.push({
       category,
       tierUsed,
+      minutes,
       basePrice,
       overridePrice,
       notes,
@@ -451,7 +431,8 @@ const buildCostDetailRows = (
   customDetailRows.forEach((row, index) => {
     rows.push({
       category: row.category?.trim() || `Custom category ${index + 1}`,
-      tierUsed: 'Custom',
+      tierUsed: '',
+      minutes: null,
       basePrice: 0,
       overridePrice: Number.isFinite(row.price) ? Math.max(0, row.price ?? 0) : null,
       notes: row.note ?? '',
@@ -570,6 +551,7 @@ const buildTerracePlanterCostDetailsHtml = (
   const rows = detailRows.map((row) => [
     row.category,
     row.tierUsed,
+    formatMinutes(row.minutes),
     formatCurrency(row.basePrice),
     row.isMaterial ? 'Not applicable' : row.overridePrice === null ? '-' : formatCurrency(row.overridePrice),
     row.notes,
@@ -579,9 +561,9 @@ const buildTerracePlanterCostDetailsHtml = (
     '<section style="display:grid;gap:14px;border:1px solid #cbd5e1;background:#ffffff;padding:16px;">',
     buildVisualSectionHeaderHtml(
       'Cost details',
-      'Material and fabrication tiers are shown alongside liner/add-on costs. Tier selections follow the calculated volume.',
+      'Material inventory, paint weight, fixed prices, and calculated labor minutes are shown by category.',
     ),
-    `<div style="padding-bottom:72px;">${buildTableHtml(['Category', 'Tier used', 'Base price', 'Override price', 'Notes'], rows)}</div>`,
+    `<div style="padding-bottom:72px;">${buildTableHtml(['Category', 'Tier used', 'Minutes', 'Base price', 'Override price', 'Notes'], rows)}</div>`,
     '<div style="clear:both;margin-top:14px;border:1px solid #cbd5e1;background:#f8fafc;padding:16px;">',
     '<p style="margin:0;color:#64748b;font-size:11px;font-weight:600;letter-spacing:0.22em;text-transform:uppercase;">Total cost</p>',
     `<p style="margin:4px 0 0;color:#0f172a;font-size:18px;font-weight:700;">${escapeHtml(formatCurrency(raw.totalFabricationCost))}</p>`,
@@ -763,20 +745,21 @@ export const calculateTerracePlanter = (
     throw new Error(validationMessage)
   }
 
-  const thresholds = cloneThresholds(options.thresholds)
-  const thresholdValidationMessage = validateThresholds(thresholds)
-  if (thresholdValidationMessage) {
-    throw new Error(thresholdValidationMessage)
-  }
-
   const fabricationDims = buildFabricationDimensions(planterInput)
+  const paintSettings = normalizeTerracePlanterPaintSettings(options.paintSettings)
+  if (paintSettings.lowDimensionThreshold >= paintSettings.mediumDimensionThreshold) {
+    throw new Error('Low Paint threshold must be below the medium threshold.')
+  }
   const matchingThicknessInventory = validateSheetInventory(
     planterInput,
     fabricationDims,
     options.sheetInventory ?? DEFAULT_SHEET_INVENTORY,
   )
-  const volume = fabricationDims.length * fabricationDims.width * fabricationDims.height
-  const breakdowns = buildBreakdownResults(volume, planterInput, thresholds)
+  const breakdowns = buildTerracePlanterCostBreakdowns(
+    planterInput,
+    options.laborRates,
+    paintSettings,
+  )
   const solverResult = runPlanterSolver({
     planterInput,
     fabricationDims,
@@ -794,6 +777,7 @@ export const calculateTerracePlanter = (
   const breakdownTotal = breakdowns.reduce((total, row) => {
     if (row.category === 'Liner' && !planterInput.linerEnabled) return total
     if (row.category === 'Shelf' && !planterInput.shelfEnabled) return total
+    if (row.category === 'Weight Plate' && !planterInput.weightPlateEnabled) return total
     return total + getBreakdownPrice(row)
   }, 0)
   const customBreakdownTotal = (options.customDetailRows ?? []).reduce((total, row) => {
@@ -823,7 +807,8 @@ export const calculateTerracePlanter = (
 
   const raw: TerracePlanterCalculationRawResult = {
     fabricationDims,
-    volume,
+    volume: fabricationDims.length * fabricationDims.width * fabricationDims.height,
+    paintSettings,
     breakdowns,
     solverResult,
     sheetSummaries,

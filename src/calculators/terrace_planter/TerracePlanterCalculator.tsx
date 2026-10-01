@@ -31,7 +31,7 @@ import { Tabs, TabsContent } from '@/components/ui/tabs'
 import { Menubar, MenubarMenu, MenubarTrigger } from '@/components/ui/menubar'
 import { cn } from '@/lib/utils'
 import { parseCsv, serializeCsv } from '@/lib/csv'
-import type { CostBreakdownPreview, CostThreshold, PlanterInput } from '@/types'
+import type { CostBreakdownPreview, PlanterInput } from '@/types'
 import {
   DEFAULT_SHEET_INVENTORY,
   buildFabricationDimensions,
@@ -40,13 +40,25 @@ import {
   type SolverResult,
 } from '@/lib/terrace_planter/planterSolver'
 import {
-  CATEGORY_LIST,
+  DEFAULT_LABOR_RATES,
+  DEFAULT_PAINT_SETTINGS,
   DEFAULT_PLANTER_INPUT,
   DEFAULT_RESULT_COLOR_THRESHOLDS,
-  DEFAULT_THRESHOLDS,
-  type Category,
   type ResultColorThresholds,
+  type TerracePlanterLaborRates,
+  type TerracePlanterPaintSettings,
 } from '@/lib/terrace_planter/planterDefaults'
+import {
+  applyTerracePlanterDerivedPrices,
+  buildTerracePlanterCostBreakdowns,
+  getTerracePlanterAssemblyMinutes,
+  getTerracePlanterGrindMinutes,
+  getTerracePlanterPaintLaborMinutes,
+  getTerracePlanterPaintWeightKg,
+  getTerracePlanterWeldMinutes,
+  normalizeTerracePlanterLaborRates,
+  normalizeTerracePlanterPaintSettings,
+} from '@/lib/terrace_planter/planterCosts'
 
 type SheetSummaryRow = {
   rowId: string
@@ -65,10 +77,12 @@ type ResultsCategory =
   | 'Material'
   | 'Weld'
   | 'Grind'
-  | 'Paint'
+  | 'Paint Material'
+  | 'Paint Labor'
   | 'Assembly'
   | 'Saw'
   | 'Laser Bend'
+  | 'Overhead'
   | 'Weight Plate'
   | 'Liner'
   | 'Shelf'
@@ -86,6 +100,7 @@ type CostDetailRow =
       kind: 'standard'
       category: ResultsCategory
       tierUsed: string
+      minutes: number | null
       basePrice: number
       overridePrice: number | null
       notes: string
@@ -94,7 +109,8 @@ type CostDetailRow =
       id: string
       kind: 'custom'
       category: string
-      tierUsed: 'Custom'
+      tierUsed: ''
+      minutes: null
       basePrice: number
       overridePrice: number | null
       notes: string
@@ -106,10 +122,12 @@ const RESULTS_CATEGORY_ORDER: ResultsCategory[] = [
   'Material',
   'Weld',
   'Grind',
-  'Paint',
+  'Paint Material',
+  'Paint Labor',
   'Assembly',
   'Saw',
   'Laser Bend',
+  'Overhead',
   'Weight Plate',
   'Liner',
   'Shelf',
@@ -126,11 +144,18 @@ const PERCENT_FORMATTER = new Intl.NumberFormat('en-US', {
   maximumFractionDigits: 1,
 })
 
+const MINUTES_FORMATTER = new Intl.NumberFormat('en-US', {
+  maximumFractionDigits: 2,
+})
+
 const formatCurrencyValue = (value: number) =>
   CURRENCY_FORMATTER.format(Number.isFinite(value) ? value : 0)
 
 const formatPercentValue = (value: number) =>
   `${PERCENT_FORMATTER.format(Number.isFinite(value) ? value : 0)}%`
+
+const formatMinutesValue = (value: number) =>
+  MINUTES_FORMATTER.format(Number.isFinite(value) ? value : 0)
 
 const thicknessOptions = [
   { label: '1/8" (0.125")', value: 0.125 },
@@ -138,8 +163,6 @@ const thicknessOptions = [
 ]
 
 const defaultPlanterInput: PlanterInput = { ...DEFAULT_PLANTER_INPUT }
-const defaultThresholds: Record<Category, CostThreshold> = DEFAULT_THRESHOLDS
-const categoryList: Category[] = [...CATEGORY_LIST]
 
 const generateSheetId = () => {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
@@ -173,7 +196,8 @@ const createCustomDetailRow = (): CustomDetailRow => ({
   note: '',
 })
 
-const LOCAL_STORAGE_KEY = 'planterCostThresholds-v1'
+const LABOR_RATES_STORAGE_KEY = 'planterLaborRates-v1'
+const PAINT_SETTINGS_STORAGE_KEY = 'planterPaintSettings-v1'
 const RESULT_COLOR_STORAGE_KEY = 'planterResultColorThresholds-v1'
 
 const DEFAULT_RESULTS_SECTION_STATE: Record<ResultsSectionKey, boolean> = {
@@ -221,23 +245,6 @@ const normalizeResultColorThresholds = (
     : DEFAULT_RESULT_COLOR_THRESHOLDS.wasteWarnMax,
 })
 
-const cloneThresholds = (source?: Partial<Record<Category, CostThreshold>>) =>
-  categoryList.reduce<Record<Category, CostThreshold>>((acc, category) => {
-    const template = source?.[category] ?? defaultThresholds[category]
-    acc[category] = { ...template, category }
-    return acc
-  }, {} as Record<Category, CostThreshold>)
-
-const determineTier = (volume: number, threshold: CostThreshold) => {
-  if (volume <= threshold.lowThreshold) {
-    return { tier: 'Low' as const, price: threshold.lowPrice }
-  }
-  if (volume <= threshold.mediumThreshold) {
-    return { tier: 'Medium' as const, price: threshold.mediumPrice }
-  }
-  return { tier: 'High' as const, price: threshold.highPrice }
-}
-
 const validatePlanterInput = (input: PlanterInput) => {
   if (!Number.isFinite(input.length)) return 'Length must be a valid number.'
   if (input.length <= 0) return 'Length must be greater than zero.'
@@ -272,7 +279,8 @@ type BooleanPlanterField =
   | 'shelfEnabled'
   | 'floorEnabled'
   | 'allowSplitting'
-type ThresholdField = 'lowThreshold' | 'lowPrice' | 'mediumThreshold' | 'mediumPrice' | 'highPrice'
+type LaborRateField = keyof TerracePlanterLaborRates
+type PaintSettingField = keyof TerracePlanterPaintSettings
 type MeasurementUnit = 'in' | 'mm'
 
 const INCH_TO_MM = 25.4
@@ -306,31 +314,6 @@ const parseNumberCell = (rawValue: string) => {
   return Number.isFinite(value) ? value : null
 }
 
-const loadStoredThresholds = (): Record<Category, CostThreshold> => {
-  if (typeof window === 'undefined') return cloneThresholds()
-
-  // Persisted settings are optional; silently fall back if parsing/shape fails.
-  const stored = window.localStorage.getItem(LOCAL_STORAGE_KEY)
-  if (!stored) return cloneThresholds()
-
-  try {
-    const parsed = JSON.parse(stored) as Partial<Record<Category, CostThreshold>>
-    const isValid = categoryList.every((category) => {
-      const candidate = parsed[category]
-      return (
-        typeof candidate?.lowThreshold === 'number' &&
-        typeof candidate?.mediumThreshold === 'number' &&
-        typeof candidate?.lowPrice === 'number' &&
-        typeof candidate?.mediumPrice === 'number' &&
-        typeof candidate?.highPrice === 'number'
-      )
-    })
-    return isValid ? cloneThresholds(parsed) : cloneThresholds()
-  } catch {
-    return cloneThresholds()
-  }
-}
-
 const loadStoredResultColorThresholds = (): ResultColorThresholds => {
   if (typeof window === 'undefined') return DEFAULT_RESULT_COLOR_THRESHOLDS
 
@@ -345,10 +328,41 @@ const loadStoredResultColorThresholds = (): ResultColorThresholds => {
   }
 }
 
+const loadStoredLaborRates = (): TerracePlanterLaborRates => {
+  if (typeof window === 'undefined') return { ...DEFAULT_LABOR_RATES }
+
+  const stored = window.localStorage.getItem(LABOR_RATES_STORAGE_KEY)
+  if (!stored) return { ...DEFAULT_LABOR_RATES }
+
+  try {
+    return normalizeTerracePlanterLaborRates(
+      JSON.parse(stored) as Partial<TerracePlanterLaborRates>,
+    )
+  } catch {
+    return { ...DEFAULT_LABOR_RATES }
+  }
+}
+
+const loadStoredPaintSettings = (): TerracePlanterPaintSettings => {
+  if (typeof window === 'undefined') return { ...DEFAULT_PAINT_SETTINGS }
+
+  const stored = window.localStorage.getItem(PAINT_SETTINGS_STORAGE_KEY)
+  if (!stored) return { ...DEFAULT_PAINT_SETTINGS }
+
+  try {
+    return normalizeTerracePlanterPaintSettings(
+      JSON.parse(stored) as Partial<TerracePlanterPaintSettings>,
+    )
+  } catch {
+    return { ...DEFAULT_PAINT_SETTINGS }
+  }
+}
+
 function App() {
   const [planterInput, setPlanterInput] = useState<PlanterInput>(() => ({ ...defaultPlanterInput }))
   const [measurementUnit, setMeasurementUnit] = useState<MeasurementUnit>('in')
-  const [thresholds, setThresholds] = useState<Record<Category, CostThreshold>>(loadStoredThresholds)
+  const [laborRates, setLaborRates] = useState<TerracePlanterLaborRates>(loadStoredLaborRates)
+  const [paintSettings, setPaintSettings] = useState<TerracePlanterPaintSettings>(loadStoredPaintSettings)
   const [fabricationDims, setFabricationDims] = useState({ length: 0, width: 0, height: 0 })
   const [breakdowns, setBreakdowns] = useState<CostBreakdownPreview[]>([])
   const [calculationError, setCalculationError] = useState<string | null>(null)
@@ -382,32 +396,29 @@ function App() {
   const [settingsBanner, setSettingsBanner] = useState<{ type: 'success' | 'error'; message: string } | null>(null)
   const settingsImportInputRef = useRef<HTMLInputElement | null>(null)
 
-  const thresholdErrors = useMemo(() => {
-    // Keep field-level validation derived from source thresholds to avoid
-    // effect-driven synchronization state.
-    const nextErrors: Record<Category, string | undefined> = {} as Record<Category, string | undefined>
-    categoryList.forEach((category) => {
-      const entry = thresholds[category]
-      if (
-        !Number.isFinite(entry.lowThreshold) ||
-        !Number.isFinite(entry.mediumThreshold) ||
-        !Number.isFinite(entry.lowPrice) ||
-        !Number.isFinite(entry.mediumPrice) ||
-        !Number.isFinite(entry.highPrice)
-      ) {
-        nextErrors[category] = 'All threshold and price values must be valid numbers.'
-      } else if (entry.lowThreshold >= entry.mediumThreshold) {
-        nextErrors[category] = 'Low threshold must be smaller than the medium threshold.'
-      } else {
-        nextErrors[category] = undefined
-      }
-    })
-    return nextErrors
-  }, [thresholds])
-  const hasThresholdErrors = useMemo(
-    () => Object.values(thresholdErrors).some((message) => message !== undefined && message !== ''),
-    [thresholdErrors],
-  )
+  const hasLaborRateErrors =
+    !Number.isFinite(laborRates.weldHourlyRate) ||
+    laborRates.weldHourlyRate < 0 ||
+    !Number.isFinite(laborRates.assemblyHourlyRate) ||
+    laborRates.assemblyHourlyRate < 0 ||
+    !Number.isFinite(laborRates.grindHourlyRate) ||
+    laborRates.grindHourlyRate < 0 ||
+    !Number.isFinite(laborRates.paintHourlyRate) ||
+    laborRates.paintHourlyRate < 0
+  const hasPaintSettingsErrors =
+    !Number.isFinite(paintSettings.materialRatePerKg) ||
+    paintSettings.materialRatePerKg < 0 ||
+    !Number.isFinite(paintSettings.lowDimensionThreshold) ||
+    paintSettings.lowDimensionThreshold < 0 ||
+    !Number.isFinite(paintSettings.mediumDimensionThreshold) ||
+    paintSettings.mediumDimensionThreshold < 0 ||
+    paintSettings.lowDimensionThreshold >= paintSettings.mediumDimensionThreshold ||
+    !Number.isFinite(paintSettings.lowMinutes) ||
+    paintSettings.lowMinutes < 0 ||
+    !Number.isFinite(paintSettings.mediumMinutes) ||
+    paintSettings.mediumMinutes < 0 ||
+    !Number.isFinite(paintSettings.highMinutes) ||
+    paintSettings.highMinutes < 0
   const dimensionStep = measurementUnit === 'mm' ? '1' : '0.25'
   const lipStep = measurementUnit === 'mm' ? '1' : '0.125'
   const unitLabel = measurementUnit === 'mm' ? 'mm' : 'in'
@@ -426,13 +437,18 @@ function App() {
     return { length, width, height }
   }, [planterInput])
 
+  const derivedBreakdowns = useMemo(
+    () => applyTerracePlanterDerivedPrices(breakdowns),
+    [breakdowns],
+  )
+
   const breakdownLookup = useMemo(
     () =>
-      breakdowns.reduce<Record<string, CostBreakdownPreview>>((acc, row) => {
+      derivedBreakdowns.reduce<Record<string, CostBreakdownPreview>>((acc, row) => {
         acc[row.category] = row
         return acc
       }, {}),
-    [breakdowns],
+    [derivedBreakdowns],
   )
 
   const sheetSummaries = useMemo<SheetSummaryRow[]>(() => {
@@ -502,25 +518,10 @@ function App() {
   const sheetCount = sheetSummaries.reduce((total, sheet) => total + sheet.quantityUsed, 0)
 
   const totalMaterialCost = sheetMaterialCost
-  const linerBreakdown = breakdownLookup['Liner']
-  const linerLaborPreview = useMemo(() => {
-    if (!planterInput.linerEnabled) {
-      return { tierUsed: 'Disabled', laborCost: 0 }
-    }
-    const validationMessage = validatePlanterInput(planterInput)
-    if (validationMessage) {
-      return { tierUsed: 'Awaiting valid inputs', laborCost: 0 }
-    }
-    const dims = buildFabricationDimensions(planterInput)
-    const volume = dims.length * dims.width * dims.height
-    const { tier, price } = determineTier(volume, thresholds.Liner)
-    return { tierUsed: tier, laborCost: price }
-  }, [planterInput, thresholds])
-  const linerLaborTier = linerBreakdown?.tierUsed ?? linerLaborPreview.tierUsed
-  const linerLaborCost = linerBreakdown ? getBreakdownPrice(linerBreakdown) : linerLaborPreview.laborCost
-  const breakdownTotal = breakdowns.reduce((total, row) => {
+  const breakdownTotal = derivedBreakdowns.reduce((total, row) => {
     if (row.category === 'Liner' && !planterInput.linerEnabled) return total
     if (row.category === 'Shelf' && !planterInput.shelfEnabled) return total
+    if (row.category === 'Weight Plate' && !planterInput.weightPlateEnabled) return total
     return total + getBreakdownPrice(row)
   }, 0)
   const customBreakdownTotal = customDetailRows.reduce((total, row) => {
@@ -564,6 +565,7 @@ function App() {
             kind: 'standard' as const,
             category,
             tierUsed: cheapestSheet ? cheapestSheet.name : 'Awaiting calculation',
+            minutes: null,
             basePrice: totalMaterialCost,
             overridePrice: null,
             notes: solverResult
@@ -572,103 +574,57 @@ function App() {
           }
         }
 
-        if (category === 'Liner') {
-          const breakdown = linerBreakdown
-          const tierUsed = planterInput.linerEnabled
-            ? breakdown?.tierUsed ?? linerLaborTier
-            : 'Disabled'
-          const basePrice = planterInput.linerEnabled ? breakdown?.basePrice ?? linerLaborCost : 0
-          const overridePrice = planterInput.linerEnabled ? breakdown?.overridePrice ?? null : null
-          const notes = breakdown
-            ? breakdown.tierUsed === 'Not Selected'
-              ? 'Liner is not selected yet.'
-              : 'Liner labor tier applied.'
-            : planterInput.linerEnabled
-              ? 'Liner labor tier preview applied from current dimensions.'
-              : 'Liner feature disabled.'
-          return {
-            id: category,
-            kind: 'standard' as const,
-            category,
-            tierUsed,
-            basePrice,
-            overridePrice,
-            notes,
-          }
-        }
-
-        if (category === 'Shelf') {
-          const breakdown = breakdownLookup['Shelf']
-          const tierUsed = planterInput.shelfEnabled
-            ? breakdown?.tierUsed ?? 'Awaiting calculation'
-            : 'Disabled'
-          const basePrice = planterInput.shelfEnabled ? breakdown?.basePrice ?? 0 : 0
-          const overridePrice = planterInput.shelfEnabled ? breakdown?.overridePrice ?? null : null
-          const notes = breakdown
-            ? breakdown.tierUsed === 'Not Selected'
-              ? 'Shelf is not selected yet.'
-              : 'Shelf tier applied.'
-            : planterInput.shelfEnabled
-              ? 'Run calculation to assign tier.'
-              : 'Shelf feature disabled.'
-          return {
-            id: category,
-            kind: 'standard' as const,
-            category,
-            tierUsed,
-            basePrice,
-            overridePrice,
-            notes,
-          }
-        }
-
-        if (category === 'Weight Plate') {
-          const breakdown = breakdownLookup['Weight Plate']
-          const tierUsed = planterInput.weightPlateEnabled
-            ? breakdown?.tierUsed ?? 'Awaiting calculation'
-            : 'Disabled'
-          const basePrice = planterInput.weightPlateEnabled ? breakdown?.basePrice ?? 0 : 0
-          const overridePrice = planterInput.weightPlateEnabled ? breakdown?.overridePrice ?? null : null
-          const notes = breakdown
-            ? breakdown.tierUsed === 'Not Selected'
-              ? 'Weight plate is not selected yet.'
-              : 'Weight plate tier applied.'
-            : planterInput.weightPlateEnabled
-              ? 'Run calculation to assign tier.'
-              : 'Weight plate feature disabled.'
-          return {
-            id: category,
-            kind: 'standard' as const,
-            category,
-            tierUsed,
-            basePrice,
-            overridePrice,
-            notes,
-          }
-        }
-
         const breakdown = breakdownLookup[category]
-        const tierUsed = breakdown?.tierUsed ?? '-'
-        const notes = breakdown
-          ? breakdown.tierUsed === 'Not Selected'
-            ? `${category} is not selected yet.`
-            : `${breakdown.tierUsed} tier applied.`
-          : 'Run calculation to assign tier.'
+        const isDisabled =
+          (category === 'Weight Plate' && !planterInput.weightPlateEnabled) ||
+          (category === 'Liner' && !planterInput.linerEnabled) ||
+          (category === 'Shelf' && !planterInput.shelfEnabled)
+        const minutes = !isCalculated
+          ? null
+          : category === 'Weld'
+            ? getTerracePlanterWeldMinutes(planterInput)
+            : category === 'Assembly'
+              ? getTerracePlanterAssemblyMinutes(planterInput)
+              : category === 'Grind'
+                ? getTerracePlanterGrindMinutes(planterInput)
+                : category === 'Paint Labor'
+                  ? getTerracePlanterPaintLaborMinutes(planterInput, paintSettings)
+                  : null
+        const notes = isDisabled
+          ? `${category === 'Weight Plate' ? 'Weight plate' : category} feature disabled.`
+          : category === 'Weld'
+              ? 'Weld time includes the planter, floor, shelf, and liner selections.'
+              : category === 'Assembly'
+                ? 'Assembly starts at 20 minutes; a weight plate adds 10 minutes.'
+                : category === 'Grind'
+                  ? 'Grind time is 50% of Weld minutes.'
+                  : category === 'Paint Material'
+                    ? 'Paint material weight multiplied by the configured cost per kg.'
+                    : category === 'Paint Labor'
+                      ? 'Paint labor minutes use the configured largest-dimension thresholds.'
+                  : category === 'Overhead'
+                    ? '150% of Weld, Grind, Paint Labor, Assembly, Saw, and Laser Bend prices.'
+                    : 'Fixed base price applied.'
         return {
           id: category,
           kind: 'standard' as const,
           category,
-          tierUsed,
-          basePrice: breakdown?.basePrice ?? 0,
-          overridePrice: breakdown?.overridePrice ?? null,
-          notes: solverResult ? notes : 'Run calculation to assign tier.',
+          tierUsed:
+            category === 'Paint Material' && isCalculated
+              ? `${getTerracePlanterPaintWeightKg(planterInput).toFixed(3)} kg`
+              : '',
+          minutes,
+          basePrice: isDisabled ? 0 : breakdown?.basePrice ?? 0,
+          overridePrice: isDisabled ? null : breakdown?.overridePrice ?? null,
+          notes: isCalculated ? notes : 'Run calculation to calculate costs.',
         }
       }),
       ...customDetailRows.map((row) => ({
         id: row.id,
         kind: 'custom' as const,
         category: row.category,
-        tierUsed: 'Custom' as const,
+        tierUsed: '' as const,
+        minutes: null,
         basePrice: 0,
         overridePrice: row.price,
         notes: row.note,
@@ -677,12 +633,9 @@ function App() {
     [
       breakdownLookup,
       customDetailRows,
-      linerBreakdown,
-      linerLaborCost,
-      linerLaborTier,
-      planterInput.linerEnabled,
-      planterInput.weightPlateEnabled,
-      planterInput.shelfEnabled,
+      isCalculated,
+      paintSettings,
+      planterInput,
       sheetSummaries,
       solverResult,
       totalMaterialCost,
@@ -698,8 +651,14 @@ function App() {
   }, [resultBanner])
 
   useEffect(() => {
-    localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(thresholds))
-  }, [thresholds])
+    if (hasLaborRateErrors) return
+    localStorage.setItem(LABOR_RATES_STORAGE_KEY, JSON.stringify(laborRates))
+  }, [hasLaborRateErrors, laborRates])
+
+  useEffect(() => {
+    if (hasPaintSettingsErrors) return
+    localStorage.setItem(PAINT_SETTINGS_STORAGE_KEY, JSON.stringify(paintSettings))
+  }, [hasPaintSettingsErrors, paintSettings])
 
   useEffect(() => {
     localStorage.setItem(RESULT_COLOR_STORAGE_KEY, JSON.stringify(resultColorThresholds))
@@ -730,22 +689,34 @@ function App() {
     setPlanterInput((prev) => ({ ...prev, [field]: checked }))
   }
 
-  const handleThresholdChange = (category: Category, field: ThresholdField, value: number) => {
-    setThresholds((prev) => ({
-      ...prev,
-      [category]: { ...prev[category], [field]: value },
+  const handleLaborRateChange = (field: LaborRateField, value: number) => {
+    setLaborRates((current) => ({
+      ...current,
+      [field]: Number.isFinite(value) ? Math.max(0, value) : Number.NaN,
     }))
   }
 
-  const handleThresholdBlur = (category: Category, field: ThresholdField) => {
-    setThresholds((prev) => {
-      const currentValue = prev[category][field]
-      if (Number.isFinite(currentValue)) return prev
-      return {
-        ...prev,
-        [category]: { ...prev[category], [field]: 0 },
-      }
-    })
+  const handleLaborRateBlur = (field: LaborRateField) => {
+    setLaborRates((current) =>
+      Number.isFinite(current[field]) && current[field] >= 0
+        ? current
+        : { ...current, [field]: DEFAULT_LABOR_RATES[field] },
+    )
+  }
+
+  const handlePaintSettingChange = (field: PaintSettingField, value: number) => {
+    setPaintSettings((current) => ({
+      ...current,
+      [field]: Number.isFinite(value) ? Math.max(0, value) : Number.NaN,
+    }))
+  }
+
+  const handlePaintSettingBlur = (field: PaintSettingField) => {
+    setPaintSettings((current) =>
+      Number.isFinite(current[field]) && current[field] >= 0
+        ? current
+        : { ...current, [field]: DEFAULT_PAINT_SETTINGS[field] },
+    )
   }
 
   const handleSheetNameChange = (rowId: string, value: string) => {
@@ -839,8 +810,12 @@ function App() {
     })
   }
 
-  const handleResetThresholds = () => {
-    setThresholds(cloneThresholds())
+  const handleResetLaborRates = () => {
+    setLaborRates({ ...DEFAULT_LABOR_RATES })
+  }
+
+  const handleResetPaintSettings = () => {
+    setPaintSettings({ ...DEFAULT_PAINT_SETTINGS })
   }
 
   const handleResetSheetInventory = () => {
@@ -876,22 +851,38 @@ function App() {
         'high threshold',
         'high price',
       ],
-      ['meta', 'version', '1', '', '', '', '', ''],
+      ['meta', 'version', '4', '', '', '', '', ''],
     ]
 
-    categoryList.forEach((category) => {
-      const threshold = thresholds[category]
-      rows.push([
-        'threshold',
-        category,
-        String(threshold.lowThreshold),
-        String(threshold.lowPrice),
-        String(threshold.mediumThreshold),
-        String(threshold.mediumPrice),
-        'Automatic',
-        String(threshold.highPrice),
-      ])
-    })
+    rows.push(['laborRateHeader', 'category', 'hourly rate', '', '', '', '', ''])
+    rows.push(['laborRate', 'Weld', String(laborRates.weldHourlyRate), '', '', '', '', ''])
+    rows.push(['laborRate', 'Assembly', String(laborRates.assemblyHourlyRate), '', '', '', '', ''])
+    rows.push(['laborRate', 'Grind', String(laborRates.grindHourlyRate), '', '', '', '', ''])
+    rows.push(['laborRate', 'Paint', String(laborRates.paintHourlyRate), '', '', '', '', ''])
+
+    rows.push(['paintSettingsHeader', 'setting', 'value', 'minutes', '', '', '', ''])
+    rows.push(['paintMaterial', 'rate per kg', String(paintSettings.materialRatePerKg), '', '', '', '', ''])
+    rows.push([
+      'paintLabor',
+      'low',
+      String(paintSettings.lowDimensionThreshold),
+      String(paintSettings.lowMinutes),
+      '',
+      '',
+      '',
+      '',
+    ])
+    rows.push([
+      'paintLabor',
+      'medium',
+      String(paintSettings.mediumDimensionThreshold),
+      String(paintSettings.mediumMinutes),
+      '',
+      '',
+      '',
+      '',
+    ])
+    rows.push(['paintLabor', 'high', 'Automatic', String(paintSettings.highMinutes), '', '', '', ''])
 
     rows.push(['resultColorHeader', 'metric', 'risk/low', 'warn/high', '', '', '', ''])
     rows.push([
@@ -989,7 +980,8 @@ function App() {
         return
       }
 
-      const thresholdDraft: Partial<Record<Category, CostThreshold>> = {}
+      const laborRateDraft: Partial<TerracePlanterLaborRates> = {}
+      const paintSettingsDraft: Partial<TerracePlanterPaintSettings> = {}
       const resultColorDraft: Partial<ResultColorThresholds> = {}
       const importedSheets: SheetInventoryRow[] = []
       let importedSheetUnit: MeasurementUnit = 'in'
@@ -1003,6 +995,8 @@ function App() {
         if (section === 'section') continue
         if (section === 'sheetheader') continue
         if (section === 'resultcolorheader') continue
+        if (section === 'laborrateheader') continue
+        if (section === 'paintsettingsheader') continue
         if (!section) continue
 
         if (section === 'sheetmode') {
@@ -1014,32 +1008,75 @@ function App() {
         }
 
         if (section === 'threshold') {
-          const category = categoryList.find((item) => item.toLowerCase() === row[1]?.toLowerCase())
-          if (!category) {
-            setSettingsBanner({ type: 'error', message: `Unknown threshold category "${row[1] ?? ''}".` })
-            return
-          }
-
-          const lowThreshold = parseNumberCell(row[2] ?? '')
-          const lowPrice = parseNumberCell(row[3] ?? '')
-          const mediumThreshold = parseNumberCell(row[4] ?? '')
-          const mediumPrice = parseNumberCell(row[5] ?? '')
-          const highPrice = parseNumberCell(row[7] ?? '')
-          const numericValues = [lowThreshold, lowPrice, mediumThreshold, mediumPrice, highPrice]
-          if (numericValues.some((value) => value === null)) {
-            setSettingsBanner({ type: 'error', message: `Threshold values for "${category}" must be valid numbers.` })
-            return
-          }
-
-          thresholdDraft[category] = {
-            category,
-            lowThreshold: lowThreshold as number,
-            lowPrice: lowPrice as number,
-            mediumThreshold: mediumThreshold as number,
-            mediumPrice: mediumPrice as number,
-            highPrice: highPrice as number,
-          }
+          // Ignore legacy threshold rows from older settings exports.
           continue
+        }
+
+        if (section === 'laborrate') {
+          const category = row[1]?.toLowerCase()
+          const hourlyRate = parseNumberCell(row[2] ?? '')
+          if (hourlyRate === null || hourlyRate < 0) {
+            setSettingsBanner({ type: 'error', message: `Hourly rate for "${row[1] ?? ''}" must be zero or greater.` })
+            return
+          }
+          if (category === 'weld') {
+            laborRateDraft.weldHourlyRate = hourlyRate
+            continue
+          }
+          if (category === 'assembly') {
+            laborRateDraft.assemblyHourlyRate = hourlyRate
+            continue
+          }
+          if (category === 'grind') {
+            laborRateDraft.grindHourlyRate = hourlyRate
+            continue
+          }
+          if (category === 'paint') {
+            laborRateDraft.paintHourlyRate = hourlyRate
+            continue
+          }
+          setSettingsBanner({ type: 'error', message: `Unknown labor-rate category "${row[1] ?? ''}".` })
+          return
+        }
+
+        if (section === 'paintmaterial') {
+          const materialRate = parseNumberCell(row[2] ?? '')
+          if (materialRate === null || materialRate < 0) {
+            setSettingsBanner({ type: 'error', message: 'Paint material rate must be zero or greater.' })
+            return
+          }
+          paintSettingsDraft.materialRatePerKg = materialRate
+          continue
+        }
+
+        if (section === 'paintlabor') {
+          const tier = row[1]?.toLowerCase()
+          const minutes = parseNumberCell(row[3] ?? '')
+          if (minutes === null || minutes < 0) {
+            setSettingsBanner({ type: 'error', message: `Paint labor minutes for "${row[1] ?? ''}" are invalid.` })
+            return
+          }
+          if (tier === 'low' || tier === 'medium') {
+            const dimensionThreshold = parseNumberCell(row[2] ?? '')
+            if (dimensionThreshold === null || dimensionThreshold < 0) {
+              setSettingsBanner({ type: 'error', message: `Paint labor threshold for "${row[1] ?? ''}" is invalid.` })
+              return
+            }
+            if (tier === 'low') {
+              paintSettingsDraft.lowDimensionThreshold = dimensionThreshold
+              paintSettingsDraft.lowMinutes = minutes
+            } else {
+              paintSettingsDraft.mediumDimensionThreshold = dimensionThreshold
+              paintSettingsDraft.mediumMinutes = minutes
+            }
+            continue
+          }
+          if (tier === 'high') {
+            paintSettingsDraft.highMinutes = minutes
+            continue
+          }
+          setSettingsBanner({ type: 'error', message: `Unknown Paint labor tier "${row[1] ?? ''}".` })
+          return
         }
 
         if (section === 'resultcolor') {
@@ -1116,15 +1153,20 @@ function App() {
         }
       }
 
-      const hasAllThresholds = categoryList.every((category) => Boolean(thresholdDraft[category]))
-      if (!hasAllThresholds) {
-        setSettingsBanner({
-          type: 'error',
-          message: 'CSV is missing one or more threshold categories.',
-        })
-        return
+      if (Object.keys(laborRateDraft).length > 0) {
+        setLaborRates((current) => normalizeTerracePlanterLaborRates({ ...current, ...laborRateDraft }))
       }
-      setThresholds(cloneThresholds(thresholdDraft))
+      if (Object.keys(paintSettingsDraft).length > 0) {
+        const importedPaintSettings = normalizeTerracePlanterPaintSettings({
+          ...paintSettings,
+          ...paintSettingsDraft,
+        })
+        if (importedPaintSettings.lowDimensionThreshold >= importedPaintSettings.mediumDimensionThreshold) {
+          setSettingsBanner({ type: 'error', message: 'Low Paint threshold must be below the medium threshold.' })
+          return
+        }
+        setPaintSettings(importedPaintSettings)
+      }
       if (Object.keys(resultColorDraft).length > 0) {
         setResultColorThresholds(normalizeResultColorThresholds(resultColorDraft))
       }
@@ -1136,22 +1178,8 @@ function App() {
     }
   }
 
-  const buildBreakdownResults = (volume: number): CostBreakdownPreview[] =>
-    categoryList.map((category) => {
-      if (category === 'Weight Plate' && !planterInput.weightPlateEnabled) {
-        return { category, tierUsed: 'Not Selected', basePrice: 0, overridePrice: null }
-      }
-      if (category === 'Liner' && !planterInput.linerEnabled) {
-        return { category, tierUsed: 'Not Selected', basePrice: 0, overridePrice: null }
-      }
-      if (category === 'Shelf' && !planterInput.shelfEnabled) {
-        return { category, tierUsed: 'Not Selected', basePrice: 0, overridePrice: null }
-      }
-
-      const threshold = thresholds[category]
-      const { tier, price } = determineTier(volume, threshold)
-      return { category, tierUsed: tier, basePrice: price, overridePrice: null }
-    })
+  const buildBreakdownResults = (): CostBreakdownPreview[] =>
+    buildTerracePlanterCostBreakdowns(planterInput, laborRates, paintSettings)
 
   const handleCalculate = () => {
     setActiveTab('results')
@@ -1165,8 +1193,13 @@ function App() {
       setIsCalculated(false)
       return
     }
-    if (hasThresholdErrors) {
-      setCalculationError('Resolve invalid threshold settings before calculating.')
+    if (hasLaborRateErrors) {
+      setCalculationError('Labor rates must be valid non-negative numbers.')
+      setIsCalculated(false)
+      return
+    }
+    if (hasPaintSettingsErrors) {
+      setCalculationError('Resolve invalid Paint material or labor settings before calculating.')
       setIsCalculated(false)
       return
     }
@@ -1215,8 +1248,7 @@ function App() {
       return
     }
 
-    const volume = dims.length * dims.width * dims.height
-    const breakdownResults = buildBreakdownResults(volume)
+    const breakdownResults = buildBreakdownResults()
 
     setFabricationDims(dims)
     setBreakdowns(breakdownResults)
@@ -1239,6 +1271,7 @@ function App() {
       const generatedBreakdownTotal = breakdownResults.reduce((total, row) => {
         if (row.category === 'Liner' && !planterInput.linerEnabled) return total
         if (row.category === 'Shelf' && !planterInput.shelfEnabled) return total
+        if (row.category === 'Weight Plate' && !planterInput.weightPlateEnabled) return total
         return total + getBreakdownPrice(row)
       }, 0)
       const generatedTotalFabricationCost =
@@ -1259,7 +1292,7 @@ function App() {
     }
   }
 
-  const handlePriceOverride = (category: Category, value: number) => {
+  const handlePriceOverride = (category: ResultsCategory, value: number) => {
     setBreakdowns((prev) =>
       prev.map((row) =>
         row.category === category
@@ -1307,7 +1340,7 @@ function App() {
     )
   }
 
-  const handlePriceOverrideBlur = (category: Category) => {
+  const handlePriceOverrideBlur = (category: ResultsCategory) => {
     setBreakdowns((prev) =>
       prev.map((row) =>
         row.category === category && row.overridePrice !== null && !Number.isFinite(row.overridePrice)
@@ -1683,12 +1716,11 @@ function App() {
                       )}
                       <div className="rounded-xl border border-border/70 bg-muted/20 px-4 py-3 text-sm text-muted-foreground">
                         <p>
-                          <span className="font-semibold text-foreground">Liner labor tier:</span>{' '}
-                          {linerLaborTier}
+                          <span className="font-semibold text-foreground">Liner base price:</span>{' '}
+                          {formatCurrencyValue(130)}
                         </p>
                         <p>
-                          <span className="font-semibold text-foreground">Liner labor cost:</span>{' '}
-                          {formatCurrencyValue(linerLaborCost)}
+                          Liner installation time is included in the Weld minutes shown in Cost details.
                         </p>
                       </div>
                     </div>
@@ -1706,11 +1738,6 @@ function App() {
               )}
               {calculationError && (
                 <p className="text-sm text-destructive">{calculationError}</p>
-              )}
-              {hasThresholdErrors && (
-                <p className="text-sm text-warning">
-                  Fix threshold ordering on the Settings tab before recalculating.
-                </p>
               )}
             </div>
           </TabsContent>
@@ -1931,8 +1958,8 @@ function App() {
                 <div>
                   <CardTitle>Cost details</CardTitle>
                   <CardDescription>
-                    Material and fabrication tiers are shown alongside liner/add-on costs. Tier selections follow the
-                    calculated volume.
+                    Material inventory, paint weight, fixed prices, and calculated labor minutes are shown by
+                    category.
                   </CardDescription>
                 </div>
                 <div className="results-print-hide flex items-center gap-2">
@@ -1966,6 +1993,7 @@ function App() {
                       <TableRow>
                         <TableHead>Category</TableHead>
                         <TableHead>Tier used</TableHead>
+                        <TableHead>Minutes</TableHead>
                         <TableHead>Base price</TableHead>
                         <TableHead className="w-[130px]">Override price</TableHead>
                         <TableHead className="w-[320px]">Notes</TableHead>
@@ -1989,6 +2017,7 @@ function App() {
                           )}
                         </TableCell>
                         <TableCell className="text-sm text-muted-foreground">{row.tierUsed}</TableCell>
+                        <TableCell>{row.minutes === null ? '' : formatMinutesValue(row.minutes)}</TableCell>
                         <TableCell>{formatCurrencyValue(row.basePrice)}</TableCell>
                         <TableCell className="w-[130px]">
                           {row.kind === 'standard' && row.category === 'Material' ? (
@@ -2010,14 +2039,14 @@ function App() {
                                 row.kind === 'custom'
                                   ? handleCustomDetailChange(row.id, 'price', parseNumberInput(event.target.value))
                                   : handlePriceOverride(
-                                      row.category as Category,
+                                      row.category as ResultsCategory,
                                       parseNumberInput(event.target.value),
                                     )
                               }
                               onBlur={() =>
                                 row.kind === 'custom'
                                   ? handleCustomDetailPriceBlur(row.id)
-                                  : handlePriceOverrideBlur(row.category as Category)
+                                  : handlePriceOverrideBlur(row.category as ResultsCategory)
                               }
                             />
                           )}
@@ -2296,130 +2325,196 @@ function App() {
             <Card className="space-y-4">
               <CardHeader className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
                 <div>
+                  <CardTitle>Labor rates</CardTitle>
+                  <CardDescription>
+                    Labor minutes are converted to hours and multiplied by these hourly rates.
+                  </CardDescription>
+                </div>
+                <Button size="sm" variant="ghost" onClick={handleResetLaborRates}>
+                  Reset to defaults
+                </Button>
+              </CardHeader>
+              <CardContent className="space-y-3">
+                <div className="grid gap-4 sm:grid-cols-2">
+                  <div className="space-y-1">
+                    <Label htmlFor="weld-hourly-rate">Weld rate ($/hr)</Label>
+                    <Input
+                      id="weld-hourly-rate"
+                      type="number"
+                      min="0"
+                      step="0.5"
+                      value={displayNumberInput(laborRates.weldHourlyRate)}
+                      onChange={(event: ChangeEvent<HTMLInputElement>) =>
+                        handleLaborRateChange('weldHourlyRate', parseNumberInput(event.target.value))
+                      }
+                      onBlur={() => handleLaborRateBlur('weldHourlyRate')}
+                    />
+                  </div>
+                  <div className="space-y-1">
+                    <Label htmlFor="assembly-hourly-rate">Assembly rate ($/hr)</Label>
+                    <Input
+                      id="assembly-hourly-rate"
+                      type="number"
+                      min="0"
+                      step="0.5"
+                      value={displayNumberInput(laborRates.assemblyHourlyRate)}
+                      onChange={(event: ChangeEvent<HTMLInputElement>) =>
+                        handleLaborRateChange('assemblyHourlyRate', parseNumberInput(event.target.value))
+                      }
+                      onBlur={() => handleLaborRateBlur('assemblyHourlyRate')}
+                    />
+                  </div>
+                  <div className="space-y-1">
+                    <Label htmlFor="grind-hourly-rate">Grind rate ($/hr)</Label>
+                    <Input
+                      id="grind-hourly-rate"
+                      type="number"
+                      min="0"
+                      step="0.5"
+                      value={displayNumberInput(laborRates.grindHourlyRate)}
+                      onChange={(event: ChangeEvent<HTMLInputElement>) =>
+                        handleLaborRateChange('grindHourlyRate', parseNumberInput(event.target.value))
+                      }
+                      onBlur={() => handleLaborRateBlur('grindHourlyRate')}
+                    />
+                  </div>
+                  <div className="space-y-1">
+                    <Label htmlFor="paint-hourly-rate">Paint labor rate ($/hr)</Label>
+                    <Input
+                      id="paint-hourly-rate"
+                      type="number"
+                      min="0"
+                      step="0.5"
+                      value={displayNumberInput(laborRates.paintHourlyRate)}
+                      onChange={(event: ChangeEvent<HTMLInputElement>) =>
+                        handleLaborRateChange('paintHourlyRate', parseNumberInput(event.target.value))
+                      }
+                      onBlur={() => handleLaborRateBlur('paintHourlyRate')}
+                    />
+                  </div>
+                </div>
+                {hasLaborRateErrors && (
+                  <p className="text-xs text-destructive">Hourly rates must be valid non-negative numbers.</p>
+                )}
+              </CardContent>
+            </Card>
+            <Card className="space-y-4">
+              <CardHeader className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
+                <div>
                   <CardTitle>Cost thresholds</CardTitle>
                   <CardDescription>
-                    Volume thresholds in cubic inches drive which tier applies for each fabrication category.
+                    Paint material pricing and Paint labor dimension thresholds are configured below.
                   </CardDescription>
                 </div>
                 <div className="flex flex-wrap gap-2">
-                  <Button size="sm" variant="ghost" onClick={handleResetThresholds}>
-                    Reset to defaults
+                  <Button size="sm" variant="ghost" onClick={handleResetPaintSettings}>
+                    Reset Paint
                   </Button>
                 </div>
               </CardHeader>
                 <CardContent className="space-y-6">
-                  <div className="grid gap-2 text-xs uppercase tracking-[0.3em] text-muted-foreground sm:grid-cols-3 text-center">
-                    <span>Low</span>
-                    <span>Medium</span>
-                    <span>High</span>
+                  <div className="space-y-4 rounded-2xl border border-border/50 bg-muted/20 p-4">
+                    <div className="flex items-center justify-between gap-3">
+                      <span className="font-semibold text-foreground">Paint Material</span>
+                      {hasPaintSettingsErrors && (
+                        <p className="text-xs text-destructive">
+                          Enter valid rates, ordered thresholds, and minutes.
+                        </p>
+                      )}
+                    </div>
+                    <div className="max-w-sm space-y-1">
+                      <Label htmlFor="paint-material-rate">Paint cost ($/kg)</Label>
+                      <Input
+                        id="paint-material-rate"
+                        type="number"
+                        min="0"
+                        step="0.5"
+                        value={displayNumberInput(paintSettings.materialRatePerKg)}
+                        onChange={(event: ChangeEvent<HTMLInputElement>) =>
+                          handlePaintSettingChange('materialRatePerKg', parseNumberInput(event.target.value))
+                        }
+                        onBlur={() => handlePaintSettingBlur('materialRatePerKg')}
+                      />
+                    </div>
                   </div>
-                  <div className="space-y-4">
-                    {categoryList.map((category) => {
-                      const error = thresholdErrors[category]
-                      return (
-                        <div
-                          key={category}
-                          className="space-y-3 rounded-2xl border border-border/50 bg-muted/20 p-4"
-                        >
-                          <div className="flex items-center justify-between gap-3">
-                            <span className="font-semibold text-foreground">{category}</span>
-                            {error && (
-                              <p className="text-xs text-destructive">{error}</p>
-                            )}
-                          </div>
-                          <div className="grid gap-3 text-sm sm:grid-cols-3">
-                            <div className="space-y-1">
-                              <Label htmlFor={`${category}-lowThreshold`}>Threshold</Label>
-                              <Input
-                                id={`${category}-lowThreshold`}
-                                type="number"
-                                min="0"
-                                step="100"
-                                value={displayNumberInput(thresholds[category].lowThreshold)}
-                                onChange={(event: ChangeEvent<HTMLInputElement>) =>
-                                  handleThresholdChange(
-                                    category,
-                                    'lowThreshold',
-                                    parseNumberInput(event.target.value),
-                                  )
-                                }
-                                onBlur={() => handleThresholdBlur(category, 'lowThreshold')}
-                              />
-                              <Label htmlFor={`${category}-lowPrice`}>Price</Label>
-                              <Input
-                                id={`${category}-lowPrice`}
-                                type="number"
-                                min="0"
-                                step="1"
-                                value={displayNumberInput(thresholds[category].lowPrice)}
-                                onChange={(event: ChangeEvent<HTMLInputElement>) =>
-                                  handleThresholdChange(category, 'lowPrice', parseNumberInput(event.target.value))
-                                }
-                                onBlur={() => handleThresholdBlur(category, 'lowPrice')}
-                              />
-                            </div>
-                            <div className="space-y-1">
-                              <Label htmlFor={`${category}-mediumThreshold`}>Threshold</Label>
-                              <Input
-                                id={`${category}-mediumThreshold`}
-                                type="number"
-                                min="0"
-                                step="100"
-                                value={displayNumberInput(thresholds[category].mediumThreshold)}
-                                onChange={(event: ChangeEvent<HTMLInputElement>) =>
-                                  handleThresholdChange(
-                                    category,
-                                    'mediumThreshold',
-                                    parseNumberInput(event.target.value),
-                                  )
-                                }
-                                onBlur={() => handleThresholdBlur(category, 'mediumThreshold')}
-                              />
-                              <Label htmlFor={`${category}-mediumPrice`}>Price</Label>
-                              <Input
-                                id={`${category}-mediumPrice`}
-                                type="number"
-                                min="0"
-                                step="1"
-                                value={displayNumberInput(thresholds[category].mediumPrice)}
-                                onChange={(event: ChangeEvent<HTMLInputElement>) =>
-                                  handleThresholdChange(
-                                    category,
-                                    'mediumPrice',
-                                    parseNumberInput(event.target.value),
-                                  )
-                                }
-                                onBlur={() => handleThresholdBlur(category, 'mediumPrice')}
-                              />
-                            </div>
-                            <div className="space-y-1">
-                              <Label htmlFor={`${category}-highThreshold`}>Threshold</Label>
-                              <Input
-                                id={`${category}-highThreshold`}
-                                type="text"
-                                inputMode="none"
-                                value="Automatic"
-                                readOnly
-                                className="cursor-not-allowed bg-muted/30"
-                                aria-label={`${category} high threshold is automatic`}
-                              />
-                              <Label htmlFor={`${category}-highPrice`}>Price</Label>
-                              <Input
-                                id={`${category}-highPrice`}
-                                type="number"
-                                min="0"
-                                step="1"
-                                value={displayNumberInput(thresholds[category].highPrice)}
-                                onChange={(event: ChangeEvent<HTMLInputElement>) =>
-                                  handleThresholdChange(category, 'highPrice', parseNumberInput(event.target.value))
-                                }
-                                onBlur={() => handleThresholdBlur(category, 'highPrice')}
-                              />
-                            </div>
-                          </div>
-                        </div>
-                      )
-                    })}
+                  <div className="space-y-4 rounded-2xl border border-border/50 bg-muted/20 p-4">
+                    <span className="font-semibold text-foreground">Paint Labor</span>
+                    <div className="grid gap-3 text-sm sm:grid-cols-3">
+                      <div className="space-y-1">
+                        <Label htmlFor="paint-low-threshold">Largest dimension below (in)</Label>
+                        <Input
+                          id="paint-low-threshold"
+                          type="number"
+                          min="0"
+                          step="1"
+                          value={displayNumberInput(paintSettings.lowDimensionThreshold)}
+                          onChange={(event: ChangeEvent<HTMLInputElement>) =>
+                            handlePaintSettingChange('lowDimensionThreshold', parseNumberInput(event.target.value))
+                          }
+                          onBlur={() => handlePaintSettingBlur('lowDimensionThreshold')}
+                        />
+                        <Label htmlFor="paint-low-minutes">Minutes</Label>
+                        <Input
+                          id="paint-low-minutes"
+                          type="number"
+                          min="0"
+                          step="1"
+                          value={displayNumberInput(paintSettings.lowMinutes)}
+                          onChange={(event: ChangeEvent<HTMLInputElement>) =>
+                            handlePaintSettingChange('lowMinutes', parseNumberInput(event.target.value))
+                          }
+                          onBlur={() => handlePaintSettingBlur('lowMinutes')}
+                        />
+                      </div>
+                      <div className="space-y-1">
+                        <Label htmlFor="paint-medium-threshold">Largest dimension below (in)</Label>
+                        <Input
+                          id="paint-medium-threshold"
+                          type="number"
+                          min="0"
+                          step="1"
+                          value={displayNumberInput(paintSettings.mediumDimensionThreshold)}
+                          onChange={(event: ChangeEvent<HTMLInputElement>) =>
+                            handlePaintSettingChange('mediumDimensionThreshold', parseNumberInput(event.target.value))
+                          }
+                          onBlur={() => handlePaintSettingBlur('mediumDimensionThreshold')}
+                        />
+                        <Label htmlFor="paint-medium-minutes">Minutes</Label>
+                        <Input
+                          id="paint-medium-minutes"
+                          type="number"
+                          min="0"
+                          step="1"
+                          value={displayNumberInput(paintSettings.mediumMinutes)}
+                          onChange={(event: ChangeEvent<HTMLInputElement>) =>
+                            handlePaintSettingChange('mediumMinutes', parseNumberInput(event.target.value))
+                          }
+                          onBlur={() => handlePaintSettingBlur('mediumMinutes')}
+                        />
+                      </div>
+                      <div className="space-y-1">
+                        <Label htmlFor="paint-high-threshold">Largest dimension threshold</Label>
+                        <Input
+                          id="paint-high-threshold"
+                          type="text"
+                          value={`${displayNumberInput(paintSettings.mediumDimensionThreshold)} in and above`}
+                          readOnly
+                          className="cursor-not-allowed bg-muted/30"
+                        />
+                        <Label htmlFor="paint-high-minutes">Minutes</Label>
+                        <Input
+                          id="paint-high-minutes"
+                          type="number"
+                          min="0"
+                          step="1"
+                          value={displayNumberInput(paintSettings.highMinutes)}
+                          onChange={(event: ChangeEvent<HTMLInputElement>) =>
+                            handlePaintSettingChange('highMinutes', parseNumberInput(event.target.value))
+                          }
+                          onBlur={() => handlePaintSettingBlur('highMinutes')}
+                        />
+                      </div>
+                    </div>
                   </div>
                 <p className="text-sm text-muted-foreground">
                   Settings persist locally and are reused on every visit.
@@ -2600,6 +2695,3 @@ function App() {
 }
 
 export default App
-
-
-

@@ -26,6 +26,22 @@ export type ResultColorThresholds = {
   wasteWarnMax: number
 }
 
+export type TerracePlanterLaborRates = {
+  weldHourlyRate: number
+  assemblyHourlyRate: number
+  grindHourlyRate: number
+  paintHourlyRate: number
+}
+
+export type TerracePlanterPaintSettings = {
+  materialRatePerKg: number
+  lowDimensionThreshold: number
+  mediumDimensionThreshold: number
+  lowMinutes: number
+  mediumMinutes: number
+  highMinutes: number
+}
+
 export type SheetInventoryDefaultRow = {
   id: string
   name: string
@@ -40,6 +56,8 @@ export type SheetInventoryDefaultRow = {
 type SettingsFile = {
   defaultPlanterInput?: Partial<Record<keyof PlanterInput, unknown>>
   defaultThresholds?: Partial<Record<Category, Partial<Record<keyof CostThreshold, unknown>>>>
+  defaultLaborRates?: Partial<Record<keyof TerracePlanterLaborRates, unknown>>
+  defaultPaintSettings?: Partial<Record<keyof TerracePlanterPaintSettings, unknown>>
   defaultResultColorThresholds?: Partial<Record<keyof ResultColorThresholds, unknown>>
   defaultSheetInventory?: Array<Partial<Record<keyof SheetInventoryDefaultRow, unknown>>>
 }
@@ -185,6 +203,26 @@ export const DEFAULT_THRESHOLDS: Record<Category, CostThreshold> = CATEGORY_LIST
   }
   return acc
 }, {} as Record<Category, CostThreshold>)
+
+const laborRatesRaw = settings.defaultLaborRates ?? {}
+
+export const DEFAULT_LABOR_RATES: TerracePlanterLaborRates = {
+  weldHourlyRate: toNumber(laborRatesRaw.weldHourlyRate, 25),
+  assemblyHourlyRate: toNumber(laborRatesRaw.assemblyHourlyRate, 22),
+  grindHourlyRate: toNumber(laborRatesRaw.grindHourlyRate, 22),
+  paintHourlyRate: toNumber(laborRatesRaw.paintHourlyRate, 24),
+}
+
+const paintSettingsRaw = settings.defaultPaintSettings ?? {}
+
+export const DEFAULT_PAINT_SETTINGS: TerracePlanterPaintSettings = {
+  materialRatePerKg: toNumber(paintSettingsRaw.materialRatePerKg, 15),
+  lowDimensionThreshold: toNumber(paintSettingsRaw.lowDimensionThreshold, 48),
+  mediumDimensionThreshold: toNumber(paintSettingsRaw.mediumDimensionThreshold, 72),
+  lowMinutes: toNumber(paintSettingsRaw.lowMinutes, 20),
+  mediumMinutes: toNumber(paintSettingsRaw.mediumMinutes, 24),
+  highMinutes: toNumber(paintSettingsRaw.highMinutes, 48),
+}
 
 const resultColorFallbacks: ResultColorThresholds = {
   marginWarnMax: 20,
